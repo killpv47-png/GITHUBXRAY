@@ -1,0 +1,586 @@
+name: kill_pv2 Ultimate Sub-Based Telegram Panel
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  run-telegram-panel:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Setup Python & Install Dependencies
+      run: |
+        python3 -m pip install --upgrade pip
+        pip3 install pyTelegramBotAPI requests[socks]
+
+    - name: Install Tor & Xray Core
+      run: |
+        sudo apt-get update && sudo apt-get install -y tor
+        sudo systemctl start tor
+        
+        sudo bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+        sudo mkdir -p /usr/local/etc/xray
+        sudo chmod -R 777 /usr/local/etc/xray
+
+    - name: Install and Configure Nginx Reverse Proxy
+      run: |
+        sudo apt-get install -y nginx
+        sudo rm -f /etc/nginx/sites-enabled/default
+        cat <<'PANEL_EOF' | sudo tee /etc/nginx/sites-available/tg_panel_proxy
+        server {
+            listen 8080 default_server;
+            listen [::]:8080 default_server;
+
+            location /killpv2 {
+                proxy_redirect off;
+                proxy_pass http://127.0.0.1:8085;
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection "upgrade";
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            }
+
+            location /sub/ {
+                proxy_pass http://127.0.0.1:8086;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+            }
+        }
+        PANEL_EOF
+        sudo ln -s /etc/nginx/sites-available/tg_panel_proxy /etc/nginx/sites-enabled/
+        sudo systemctl restart nginx
+
+    - name: Connect Cloudflare Tunnel (Anti-Filter)
+      run: |
+        wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+        sudo dpkg -i cloudflared-linux-amd64.deb
+        
+        nohup cloudflared tunnel --url http://localhost:8080 > cloudflare.log 2>&1 &
+        
+        for i in {1..30}; do
+          HOST=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' cloudflare.log | head -n 1 | sed 's/https:\/\///g')
+          if [ ! -z "$HOST" ]; then
+              echo "Tunnel Connected Successfully: $HOST"
+              echo "$HOST" > tunnel_host.txt
+              break
+          fi
+          echo "Waiting for Cloudflare Tunnel to generate host... ($i/30)"
+          sleep 2
+        done
+        
+        if [ ! -f tunnel_host.txt ]; then
+          echo "Error: Cloudflare Tunnel failed to start!"
+          exit 1
+        fi
+
+    - name: Run Telegram Bot Core System
+      run: |
+        cat <<'PANEL_EOF' > tg_panel.py
+        import telebot
+        from telebot import types
+        from telebot import apihelper
+        import threading
+        import subprocess
+        import os
+        import time
+        import json
+        import re
+        import uuid
+        import base64
+        import html
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        apihelper.proxy = {'https': 'socks5h://127.0.0.1:9050'}
+
+        TOKEN = "8805720773:AAEjmdzjspL_bC_AzhyH5qwMNX8RQ0yho_k"
+        ADMIN_CHAT_ID = "8517754313"
+        bot = telebot.TeleBot(TOKEN)
+
+        CONFIG_PATH = "/usr/local/etc/xray/config.json"
+        db_file = "panel_db.json"
+        ONLINE_TIMEOUT = 120
+
+        with open('tunnel_host.txt', 'r') as f:
+            tunnel_host = f.read().strip()
+
+        if os.path.exists(db_file):
+            with open(db_file, 'r') as f:
+                configs_db = json.load(f)
+        else:
+            configs_db = {
+                "Main_kill_pv2": {
+                    "uuid": "b6a00fb0-460e-4323-96af-3ba2f48470ee",
+                    "limit": 0,
+                    "type": "regular",
+                    "clean_ip": "speed.cloudflare.com",
+                    "used": 0,
+                    "xray_last": 0,
+                    "status": "OFFLINE",
+                    "last_seen": 0
+                }
+            }
+
+        def save_db():
+            with open(db_file, 'w') as f:
+                json.dump(configs_db, f, indent=4)
+
+        def rebuild_xray():
+            for name in configs_db:
+                configs_db[name]["xray_last"] = 0
+            save_db()
+
+            clients = []
+            for name, data in configs_db.items():
+                clients.append({"id": data["uuid"], "email": name, "level": 0})
+                
+            xray_config = {
+                "log": {"loglevel": "warning"},
+                "api": {
+                    "tag": "api",
+                    "services": ["StatsService"]
+                },
+                "stats": {},
+                "policy": {
+                    "levels": {
+                        "0": {
+                            "statsUserUplink": True,
+                            "statsUserDownlink": True
+                        }
+                    },
+                    "system": {
+                        "statsInboundUplink": True,
+                        "statsInboundDownlink": True
+                    }
+                },
+                "inbounds": [
+                    {
+                        "port": 8085,
+                        "protocol": "vless",
+                        "settings": {"clients": clients, "decryption": "none"},
+                        "streamSettings": {
+                            "network": "ws",
+                            "wsSettings": {"path": "/killpv2"}
+                        }
+                    },
+                    {
+                        "listen": "127.0.0.1",
+                        "port": 10085,
+                        "protocol": "dokodemo-door",
+                        "settings": {"address": "127.0.0.1"},
+                        "tag": "api"
+                    }
+                ],
+                "outbounds": [
+                    {"protocol": "freedom", "tag": "direct"},
+                    {"protocol": "freedom", "tag": "api"}
+                ],
+                "routing": {
+                    "domainStrategy": "AsIs",
+                    "rules": [
+                        {
+                            "type": "field",
+                            "inboundTag": ["api"],
+                            "outboundTag": "api"
+                        }
+                    ]
+                }
+            }
+            with open(CONFIG_PATH, 'w') as f:
+                json.dump(xray_config, f, indent=4)
+                
+            subprocess.run("sudo killall xray || true", shell=True)
+            subprocess.run("sudo nohup /usr/local/bin/xray -config /usr/local/etc/xray/config.json > /usr/local/etc/xray/xray.log 2>&1 &", shell=True)
+
+        def main_menu_keyboard():
+            kbd = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+            kbd.add(
+                types.KeyboardButton("➕ ساخت کانفیگ جدید"),
+                types.KeyboardButton("📋 لیست کانفیگ‌ها و وضعیت"),
+                types.KeyboardButton("🛠️ سیستم دیباگ و لاگ‌ها")
+            )
+            return kbd
+
+        @bot.message_handler(commands=['start', 'menu'])
+        def send_start(message):
+            if str(message.chat.id) != ADMIN_CHAT_ID: return
+            bot.send_message(ADMIN_CHAT_ID, "👑 <b>پنل مدیریت kill_pv2 لایو شد:</b>", reply_markup=main_menu_keyboard(), parse_mode="HTML")
+
+        user_wizard = {}
+
+        @bot.message_handler(func=lambda message: str(message.chat.id) == ADMIN_CHAT_ID)
+        def handle_text_buttons(message):
+            if message.text == "➕ ساخت کانفیگ جدید":
+                msg = bot.send_message(ADMIN_CHAT_ID, "📝 <b>اسم کانفیگ جدید رو بفرست داداش:</b>", reply_markup=types.ReplyKeyboardRemove(), parse_mode="HTML")
+                bot.register_next_step_handler(msg, step_get_name)
+            elif message.text == "📋 لیست کانفیگ‌ها و وضعیت":
+                show_list_view()
+            elif message.text == "🛠️ سیستم دیباگ و لاگ‌ها":
+                show_system_logs()
+
+        def show_system_logs():
+            try:
+                xray_check = subprocess.run("pgrep xray", shell=True, capture_output=True, text=True)
+                xray_status = "🟢 روشن" if xray_check.stdout.strip() else "🔴 خاموش (کرش یا متوقف شده)"
+                
+                nginx_check = subprocess.run("systemctl is-active nginx", shell=True, capture_output=True, text=True)
+                nginx_status = "🟢 روشن" if "active" in nginx_check.stdout else "🔴 خاموش"
+                
+                cf_check = subprocess.run("pgrep cloudflared", shell=True, capture_output=True, text=True)
+                cf_status = "🟢 روشن" if cf_check.stdout.strip() else "🔴 خاموش"
+                
+                xray_test = subprocess.run("/usr/local/bin/xray -test -config /usr/local/etc/xray/config.json", shell=True, capture_output=True, text=True)
+                raw_xray_log = xray_test.stderr.strip() if xray_test.stderr.strip() else xray_test.stdout.strip()
+                if not raw_xray_log:
+                    raw_xray_log = "ساختار بدون نقص و تایید شده"
+                if len(raw_xray_log) > 1000:
+                    raw_xray_log = raw_xray_log[-1000:]
+                xray_test_log = html.escape(raw_xray_log)
+                
+                runtime_log = "فایلی وجود ندارد یا لاگی ثبت نشده."
+                if os.path.exists("/usr/local/etc/xray/xray.log"):
+                    with open("/usr/local/etc/xray/xray.log", "r") as f:
+                        lines = f.readlines()
+                        runtime_log = "".join(lines[-15:])
+                xray_runtime_log = html.escape(runtime_log)
+                
+                raw_cf_log = "فایل لاگ یافت نشد."
+                if os.path.exists("cloudflare.log"):
+                    with open("cloudflare.log", "r") as f:
+                        lines = f.readlines()
+                        raw_cf_log = "".join(lines[-10:])
+                cf_log = html.escape(raw_cf_log)
+                
+                log_msg = f"🛠️ <b>گزارش زنده وضعیت و دیباگ سیستم kill_pv2</b>\n\n" \
+                          f"⚙️ <b>وضعیت پروسس‌ها:</b>\n" \
+                          f"🔹 هسته Xray: {xray_status}\n" \
+                          f"🔹 وب‌سرور Nginx: {nginx_status}\n" \
+                          f"🔹 تونل کلودفلر: {cf_status}\n\n" \
+                          f"📝 <b>نتیجه تست ساختار هسته Xray:</b>\n<pre><code>{xray_test_log}</code></pre>\n\n" \
+                          f"⚠️ <b>آخرین لاگ‌های زنده محیط اجرای هسته:</b>\n<pre><code>{xray_runtime_log}</code></pre>\n\n" \
+                          f"📋 <b>آخرین خطوط لاگ تونل کلودفلر:</b>\n<pre><code>{cf_log}</code></pre>"
+                          
+                bot.send_message(ADMIN_CHAT_ID, log_msg, parse_mode="HTML")
+            except Exception as e:
+                bot.send_message(ADMIN_CHAT_ID, f"❌ خطا در اجرای سیستم دیباگ: {html.escape(str(e))}", parse_mode="HTML")
+
+        def step_get_name(message):
+            name = message.text.strip().replace(" ", "_")
+            if name in configs_db or name in ["➕_ساخت_کانفیگ_جدید", "📋_لیست_کانفیگ‌ها_و_وضعیت", "🛠️_سیستم_دیباگ_و_لاگ‌ها"]:
+                bot.send_message(ADMIN_CHAT_ID, "❌ نام نامعتبر یا تکراریه داداش!", reply_markup=main_menu_keyboard(), parse_mode="HTML")
+                return
+            user_wizard[message.chat.id] = {"name": name}
+            msg = bot.send_message(ADMIN_CHAT_ID, "📊 <b>حجم کانفیگ رو وارد کن (مثلاً 5GB یا 500MB):</b>\nعدد <code>0</code> = نامحدود:", parse_mode="HTML")
+            bot.register_next_step_handler(msg, step_get_volume)
+
+        def step_get_volume(message):
+            chat_id = message.chat.id
+            raw = message.text.strip().upper().replace(" ", "")
+            limit_bytes = 0
+            
+            if raw != "0":
+                match = re.match(r"(\d+(\.\d+)?)(GB|MB)", raw)
+                if match:
+                    val = float(match.group(1))
+                    unit = match.group(3)
+                    limit_bytes = int(val * 1024 * 1024 * 1024) if unit == "GB" else int(val * 1024 * 1024)
+                else:
+                    try: limit_bytes = int(float(raw) * 1024 * 1024 * 1024)
+                    except:
+                        bot.send_message(ADMIN_CHAT_ID, "❌ فرمت حجم اشتباه بود داداش.", reply_markup=main_menu_keyboard(), parse_mode="HTML")
+                        return
+            
+            user_wizard[chat_id]["limit"] = limit_bytes
+            user_wizard[chat_id]["raw_str"] = raw if raw != "0" else "نامحدود"
+            
+            kbd = types.InlineKeyboardMarkup()
+            kbd.add(
+                types.InlineKeyboardButton("⚡ آی‌پی تمیز کلودفلر", callback_data="set_clean"),
+                types.InlineKeyboardButton("🌐 آی‌پی معمولی (دامین)", callback_data="set_regular")
+            )
+            bot.send_message(ADMIN_CHAT_ID, "✈️ <b>نوع دامین و آی‌پی اتصال رو انتخاب کن:</b>", reply_markup=kbd, parse_mode="HTML")
+
+        @bot.callback_query_handler(func=lambda call: call.data in ["set_clean", "set_regular"])
+        def step_get_ip_type(call):
+            chat_id = call.message.chat.id
+            if chat_id not in user_wizard: return
+            
+            if call.data == "set_regular":
+                state = user_wizard[chat_id]
+                name = state["name"]
+                new_uuid = str(uuid.uuid4())
+                configs_db[name] = {
+                    "uuid": new_uuid,
+                    "limit": state["limit"],
+                    "type": "regular",
+                    "clean_ip": tunnel_host,
+                    "used": 0,
+                    "xray_last": 0,
+                    "status": "OFFLINE",
+                    "last_seen": 0
+                }
+                save_db()
+                rebuild_xray()
+                
+                link = f"vless://{new_uuid}@{tunnel_host}:443?path=%2Fkillpv2&security=tls&encryption=none&insecure=0&type=ws&allowInsecure=0#{name}"
+                sub_link = f"https://{tunnel_host}/sub/{name}"
+                
+                msg = f"🚀 <b>کانفیگ معمولی ساخته شد!</b>\n\n👤 نام: <code>{name}</code>\n📊 سقف حجم: <code>{state['raw_str']}</code>\n\n👇 <b>لینک اتصال مستقیم:</b>\n<code>{link}</code>\n\n🔗 <b>لینک ساب اختصاصی (Sub):</b>\n<code>{sub_link}</code>"
+                bot.send_message(ADMIN_CHAT_ID, msg, parse_mode="HTML", reply_markup=main_menu_keyboard())
+                del user_wizard[chat_id]
+                bot.answer_callback_query(call.id)
+            else:
+                user_wizard[chat_id]["type"] = "clean"
+                msg = bot.send_message(ADMIN_CHAT_ID, "🎯 <b>انتخاب آی‌پی تمیز یا دامین اختصاصی:</b>\n\n"
+                                                       "🔢 <b>ارسال عدد <code>0</code></b> ⬅️ دامین عمومی (<code>speed.cloudflare.com</code>)\n"
+                                                       "🔢 <b>ارسال عدد <code>1</code></b> ⬅️ آی‌پی تمیز (<code>104.17.2.1</code>)\n\n"
+                                                       "✍️ یا آی‌پی اختصاصی خودت رو بفرست داداش:", parse_mode="HTML")
+                bot.register_next_step_handler(msg, step_get_clean_ip_value)
+                bot.answer_callback_query(call.id)
+
+        def step_get_clean_ip_value(message):
+            chat_id = message.chat.id
+            if chat_id not in user_wizard: return
+            
+            val = message.text.strip()
+            if val == "0":
+                clean_target = "speed.cloudflare.com"
+            elif val == "1":
+                clean_target = "104.17.2.1"
+            else:
+                clean_target = val
+            
+            state = user_wizard[chat_id]
+            name = state["name"]
+            new_uuid = str(uuid.uuid4())
+            
+            configs_db[name] = {
+                "uuid": new_uuid,
+                "limit": state["limit"],
+                "type": "clean",
+                "clean_ip": clean_target,
+                "used": 0,
+                "xray_last": 0,
+                "status": "OFFLINE",
+                "last_seen": 0
+            }
+            save_db()
+            rebuild_xray()
+            
+            link = f"vless://{new_uuid}@{clean_target}:443?path=%2Fkillpv2&security=tls&encryption=none&insecure=0&type=ws&allowInsecure=0&host={tunnel_host}&sni={tunnel_host}#{name}"
+            sub_link = f"https://{tunnel_host}/sub/{name}"
+            
+            msg = f"🚀 <b>کانفیگ با آی‌پی تمیز ساخته شد!</b>\n\n👤 نام: <code>{name}</code>\n📊 سقف حجم: <code>{state['raw_str']}</code>\n🎯 هدف: <code>{clean_target}</code>\n\n👇 <b>لینک اتصال مستقیم:</b>\n<code>{link}</code>\n\n🔗 <b>لینک ساب اختصاصی (Sub):</b>\n<code>{sub_link}</code>"
+            bot.send_message(ADMIN_CHAT_ID, msg, parse_mode="HTML", reply_markup=main_menu_keyboard())
+            del user_wizard[chat_id]
+
+        def show_list_view():
+            kbd = types.InlineKeyboardMarkup(row_width=1)
+            for name, data in configs_db.items():
+                status_icon = "🟢" if data.get("status", "OFFLINE") == "ONLINE" else "🔴"
+                kbd.add(types.InlineKeyboardButton(f"{status_icon} {name}", callback_data=f"view_{name}"))
+            bot.send_message(ADMIN_CHAT_ID, "📋 <b>لیست تمام کانفیگ‌ها:</b>", reply_markup=kbd, parse_mode="HTML")
+
+        @bot.callback_query_handler(func=lambda call: call.data.startswith("view_") or call.data.startswith("del_"))
+        def handle_list_clicks(call):
+            if str(call.message.chat.id) != ADMIN_CHAT_ID: return
+            
+            if call.data.startswith("view_"):
+                name = call.data.split("view_")[1]
+                if name not in configs_db: return
+                data = configs_db[name]
+                
+                used_mb = data["used"] / (1024 * 1024)
+                rem_bytes = max(0, data["limit"] - data["used"]) if data["limit"] > 0 else 0
+                lim_str = "نامحدود" if data["limit"] == 0 else f"{data['limit'] / (1024**3):.2f} GB"
+                rem_str = "نامحدود" if data["limit"] == 0 else f"{rem_bytes / (1024**3):.2f} GB"
+                
+                clean_ip = data.get("clean_ip", "speed.cloudflare.com")
+                link = f"vless://{data['uuid']}@{clean_ip}:443?path=%2Fkillpv2&security=tls&encryption=none&insecure=0&type=ws&allowInsecure=0&host={tunnel_host}&sni={tunnel_host}#{name}" if data["type"] == "clean" else f"vless://{data['uuid']}@{tunnel_host}:443?path=%2Fkillpv2&security=tls&encryption=none&insecure=0&type=ws&allowInsecure=0#{name}"
+                sub_link = f"https://{tunnel_host}/sub/{name}"
+                
+                msg = f"⚙️ <b>اطلاعات کانفیگ: {name}</b>\n\n" \
+                      f"📡 وضعیت اتصال: <code>{'🟢 آنلاین' if data.get('status', 'OFFLINE') == 'ONLINE' else '🔴 آفلاین'}</code>\n" \
+                      f"🎯 هدف اتصال: <code>{clean_ip if data['type'] == 'clean' else 'دامین مستقیم'}</code>\n" \
+                      f"📊 حجم کل اختصاص داده شده: <code>{lim_str}</code>\n" \
+                      f"🔥 ترافیک مصرف شده: <code>{used_mb:.2f} MB</code>\n" \
+                      f"⏳ حجم باقی‌مانده واقعی: <code>{rem_str}</code>\n\n" \
+                      f"👇 <b>کد اتصال مستقیم:</b>\n<code>{link}</code>\n\n" \
+                      f"🔗 <b>لینک ساب اختصاصی:</b>\n<code>{sub_link}</code>"
+                      
+                kbd = types.InlineKeyboardMarkup()
+                kbd.add(types.InlineKeyboardButton("🗑️ حذف کامل این کانفیگ", callback_data=f"del_{name}"))
+                bot.edit_message_text(msg, chat_id=ADMIN_CHAT_ID, message_id=call.message.message_id, reply_markup=kbd, parse_mode="HTML")
+                bot.answer_callback_query(call.id)
+                
+            elif call.data.startswith("del_"):
+                name = call.data.split("del_")[1]
+                if name in configs_db:
+                    del configs_db[name]
+                    save_db()
+                    rebuild_xray()
+                    bot.edit_message_text(f"🗑️ کانفیگ <code>{name}</code> با موفقیت حذف شد داداش.", chat_id=ADMIN_CHAT_ID, message_id=call.message.message_id, parse_mode="HTML")
+                bot.answer_callback_query(call.id)
+
+        class SubscriptionServer(BaseHTTPRequestHandler):
+            def log_message(self, format, *args): return
+            def do_GET(self):
+                path_clean = self.path.strip("/")
+                if path_clean.startswith("sub/"):
+                    name = path_clean.replace("sub/", "", 1)
+                else:
+                    name = path_clean
+                
+                if name in configs_db:
+                    data = configs_db[name]
+                    total_bytes = data["limit"]
+                    used_bytes = data["used"]
+                    rem_bytes = max(0, total_bytes - used_bytes) if total_bytes > 0 else 0
+                    
+                    def format_bytes(b, is_limit=False):
+                        if is_limit and b == 0: return "Unlimited"
+                        if b >= 1024**3: return f"{b / (1024**3):.2f}_GB"
+                        return f"{b / (1024**2):.2f}_MB"
+                    
+                    total_str = format_bytes(total_bytes, is_limit=True)
+                    used_str = format_bytes(used_bytes)
+                    rem_str = "Unlimited" if total_bytes == 0 else format_bytes(rem_bytes)
+                    
+                    info_tag = f"📊_Total:_{total_str}_|_Used:_{used_str}_|_Left:_{rem_str}"
+                    info_line = f"vless://{data['uuid']}@127.0.0.1:10000?encryption=none&type=ws#{info_tag}"
+                    
+                    clean_ip = data.get("clean_ip", "speed.cloudflare.com")
+                    if data["type"] == "clean":
+                        vless_line = f"vless://{data['uuid']}@{clean_ip}:443?path=%2Fkillpv2&security=tls&encryption=none&insecure=0&type=ws&allowInsecure=0&host={tunnel_host}&sni={tunnel_host}#{name}"
+                    else:
+                        vless_line = f"vless://{data['uuid']}@{tunnel_host}:443?path=%2Fkillpv2&security=tls&encryption=none&insecure=0&type=ws&allowInsecure=0#{name}"
+                    
+                    sub_content = f"{info_line}\n{vless_line}\n"
+                    b64_res = base64.b64encode(sub_content.encode('utf-8')).decode('utf-8')
+                    
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/plain; charset=utf-8')
+                    total_val = total_bytes if total_bytes > 0 else 1100000000000
+                    self.send_header('Subscription-Userinfo', f"upload=0; download={int(used_bytes)}; total={int(total_val)}; expire=0")
+                    self.end_headers()
+                    self.wfile.write(b64_res.encode('utf-8'))
+                    return
+                    
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"Subscription Not Found")
+
+        def run_sub_http_server():
+            server = HTTPServer(('127.0.0.1', 8086), SubscriptionServer)
+            server.serve_forever()
+
+        def traffic_accounting_loop():
+            while True:
+                time.sleep(5)
+                current_time = time.time()
+                
+                # اصلاح به دستور استاندارد و جدید هسته ایکس‌ری
+                query_cmd = '/usr/local/bin/xray api statsquery --server=127.0.0.1:10085 --pattern="user>>>" --reset=false'
+                q_res = subprocess.run(query_cmd, shell=True, capture_output=True, text=True)
+                q_out = q_res.stdout if q_res.stdout else ""
+                q_err = q_res.stderr if q_res.stderr else ""
+                
+                print("========== XRAY API RAW OUTPUT ==========")
+                print(q_out)
+                if q_err.strip():
+                    print("⚠️ XRAY API ERRORS:")
+                    print(q_err)
+                print("=========================================")
+                
+                for name, data in list(configs_db.items()):
+                    try:
+                        db, ub = 0, 0
+                        
+                        if q_out:
+                            db_pattern = r'user>>>' + re.escape(name) + r'>>>traffic>>>downlink[\s\S]*?(?:"value":\s*"(\d+)"|value:\s*(\d+))'
+                            ub_pattern = r'user>>>' + re.escape(name) + r'>>>traffic>>>uplink[\s\S]*?(?:"value":\s*"(\d+)"|value:\s*(\d+))'
+                            
+                            db_match = re.search(db_pattern, q_out)
+                            ub_match = re.search(ub_pattern, q_out)
+                            
+                            if db_match:
+                                db = int(db_match.group(1) or db_match.group(2) or 0)
+                            if ub_match:
+                                ub = int(ub_match.group(1) or ub_match.group(2) or 0)
+                        
+                        print(f"\n--- [DEBUG XRAY API FOR: {name}] ---")
+                        print(f"FETCHED DOWN: {db} Bytes | FETCHED UP: {ub} Bytes")
+                        print("------------------------------------\n")
+                        
+                        current_xray_bytes = max(0, db + ub)
+                        last_xray_bytes = data.get("xray_last", 0)
+                        
+                        if current_xray_bytes < last_xray_bytes:
+                            configs_db[name]["xray_last"] = current_xray_bytes
+                            continue
+                            
+                        diff = current_xray_bytes - last_xray_bytes
+                            
+                        if diff > 0:
+                            configs_db[name]["used"] += diff
+                            configs_db[name]["last_seen"] = current_time
+                            if configs_db[name].get("status", "OFFLINE") == "OFFLINE":
+                                configs_db[name]["status"] = "ONLINE"
+                                bot.send_message(ADMIN_CHAT_ID, f"🟢 <b>داداش کلاینت <code>{name}</code> وصل شد!</b>", parse_mode="HTML")
+                        else:
+                            if current_time - data.get("last_seen", 0) > ONLINE_TIMEOUT and data.get("status", "OFFLINE") == "ONLINE":
+                                configs_db[name]["status"] = "OFFLINE"
+                                bot.send_message(ADMIN_CHAT_ID, f"🔴 <b>کلاینت <code>{name}</code> دیسکانکت شد.</b>", parse_mode="HTML")
+                                
+                        configs_db[name]["xray_last"] = current_xray_bytes
+                        
+                        if data["limit"] > 0 and configs_db[name]["used"] >= data["limit"]:
+                            bot.send_message(ADMIN_CHAT_ID, f"🛑 <b>حجم کانفیگ <code>{name}</code> تمام و مسدود شد!</b>", parse_mode="HTML")
+                            del configs_db[name]
+                            save_db()
+                            rebuild_xray()
+                    except Exception as e:
+                        print(f"TRAFFIC LOOP CRITICAL ERROR FOR {name}: {e}")
+                try:
+                    save_db()
+                except Exception as e:
+                    print(f"DB SAVE ERROR: {e}")
+
+        def shutdown_timer():
+            time.sleep(19800)
+            try:
+                bot.send_message(ADMIN_CHAT_ID, "🔄 زمان ۵.۵ ساعت تمام شد؛ انتقال زنجیره...")
+            except:
+                pass
+            os._exit(0)
+
+        rebuild_xray()
+        bot.send_message(ADMIN_CHAT_ID, "🚀 <b>ربات مدیریت با معماری اصلاح‌شده لایو شد داداش!</b>", reply_markup=main_menu_keyboard(), parse_mode="HTML")
+        
+        threading.Thread(target=run_sub_http_server, daemon=True).start()
+        threading.Thread(target=traffic_accounting_loop, daemon=True).start()
+        threading.Thread(target=shutdown_timer, daemon=True).start()
+
+        while True:
+            try:
+                bot.infinity_polling(timeout=60, long_polling_timeout=60)
+            except Exception as e:
+                print(f"TELEGRAM POLLING ERROR: {e}")
+                time.sleep(10)
+         PANEL_EOF
+        python3 -u tg_panel.py
+
+    - name: Trigger Next Chain Run
+      env:
+        GH_TOKEN: ${{ secrets.GH_PAT }}
+      run: |
+        gh workflow run panel.yml --ref main
+        echo "✅ جاب بعدی بدون مشکل استارت خورد داداش."
