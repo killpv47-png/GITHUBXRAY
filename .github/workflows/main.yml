@@ -204,7 +204,7 @@ jobs:
         threading.Thread(target=lambda: HTTPServer(('127.0.0.1', 8086), SubscriptionServer).serve_forever(), daemon=True).start()
         threading.Thread(target=traffic_loop, daemon=True).start()
         time.sleep(19800)
-PANEL_EOF
+        PANEL_EOF
         python3 -u core_logger.py
 
     - name: Trigger Next Chain Run
@@ -408,7 +408,7 @@ PANEL_EOF
         threading.Thread(target=lambda: HTTPServer(('127.0.0.1', 8086), SubscriptionServer).serve_forever(), daemon=True).start()
         threading.Thread(target=traffic_loop, daemon=True).start()
         time.sleep(19800)
-PANEL_EOF
+        PANEL_EOF
         python3 -u core_logger_reg.py
 
     - name: Trigger Next Chain Run
